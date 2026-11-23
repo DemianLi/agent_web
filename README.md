@@ -24,7 +24,7 @@
 
 ## 嵌入對話框 `<nexus-chat>`
 
-要把對話框嵌進自己的系統（例如 3D 可視化），見 [`docs/embed-chat.md`](docs/embed-chat.md)：從哪裡開始讀、嵌入方式、用宿主頁工具讓對話控制宿主頁。
+要把對話框嵌進自己的系統（例如 3D 可視化），見 [`docs/embed-chat.md`](docs/embed-chat.md)：從哪裡開始讀、嵌入方式、沒有 serve 時的本機模擬模式、用宿主頁工具讓對話控制宿主頁。
 
 ## 如何使用
 
