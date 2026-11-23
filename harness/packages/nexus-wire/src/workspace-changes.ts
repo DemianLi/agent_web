@@ -1,0 +1,170 @@
+/**
+ * 每一輪改動檔案的紀錄上線的形狀（[#443](https://github.com/DemianLi/nexus-agent/issues/443)）。
+ *
+ * 照 dsh `workspace-changes`（`packages/deliverables/workspace-changes/src/types.ts`、
+ * `packages/client/ui-deliverables/src/{changes.ts,present-open.ts}`，`ddefc45`）：
+ *
+ * - **事件只是一個指標**：`custom` frame，`data.name` 是 {@link WORKSPACE_CHANGES}，`payload` 是
+ *   {@link WorkspaceChangesPayload}。摘要本身留在 server，web 拿 `seq` 去兩條路由要。
+ * - **摘要只活到會話結束**：serve 重開、或從日誌重播出來的那一顆，路由回 404，卡片就不畫。
+ *   **404 是正常路徑，不是錯誤**——歷史路由照樣會送出這顆 frame（同 dsh：日誌事件照樣重播）。
+ *
+ * ## 與 dsh 的偏離
+ *
+ * 1. **不帶 `turn`**（#443 第二則決議）。我們的 `turn/start` 沒有輪號；同一個輪尾並排的交付卡
+ *    （`deliverables/presented`，#441）已經不帶。在日誌上，**由 `seq` 往前找最近一顆不是 resume 的
+ *    `turn/start`** 就是它那一輪；web 的對話狀態裡沒有 `turn/start`，所以折疊器照 #441 的做法替它長一格
+ *    （`WorkspaceChangesEntry`），落在它在串流裡的位置，web 由那一格的位置認輪。所以摘要也不帶 `turn`。
+ * 2. **路徑掛在 thread 底下**：dsh 是 `/api/changes.summary?sessionId&seq`，我們的 server 一律以 thread 分路
+ *    （`/threads/:id/...`），thread id 就是 root 會話的 id。錯誤協定照 dsh：400（座標不對）、404（這台 server
+ *    不再服務這份摘要，或沒有那個 index）、500（讀檔失敗），回應帶 `cache-control: no-store`。
+ * 3. **沒有 `changes.open`**：dsh 在 Host 桌面上開檔；我們的 Host 是多人共用的遠端主機，在那裡開檔使用者
+ *    看不到（#443 第一則決議）。
+ *
+ * **兩條路由送出去的東西不一樣多**：摘要只送路徑與行數；**比較送的是檔案全文**（兩側的每一行都在 hunk 裡），
+ * 包括工作區外的檔——`danger-full-access` 或核准過的升級經符號連結改到根外時，那個檔會以主機絕對路徑列出來，
+ * 同 dsh README 的已知限制；工作區在一個更大的 git repo 裡時，repo 裡、工作區之上被改的檔也列出來
+ * （[#461](https://github.com/DemianLi/nexus-agent/issues/461)，同 dsh）。兩條都在瀏覽器會話認證（#424）之後。
+ *
+ * **`GET` 也要帶 `content-type: application/json`**，理由同 `THREADS_PATH`。
+ *
+ * @module
+ */
+
+import type {
+  WorkspaceChangedFile,
+  WorkspaceChangesSummary,
+  WorkspaceDiffHunk,
+  WorkspaceFileDiff,
+} from '@nexus/plugin-workspace-changes/types';
+
+/**
+ * 四個資料格式住在生產它們的外掛（[#689](https://github.com/DemianLi/nexus-agent/issues/689)，照 dsh），這裡只轉出，
+ * web 的引用不改。**只有型別**：wire 對外掛的相依是 devDependencies，執行期沒有這條邊。
+ */
+export type {
+  WorkspaceChangedFile,
+  WorkspaceChangesSummary,
+  WorkspaceDiffHunk,
+  WorkspaceFileDiff,
+} from '@nexus/plugin-workspace-changes/types';
+
+/** `custom` 事件的 `data.name`：一輪的改動摘要好了。 */
+export const WORKSPACE_CHANGES = 'workspace/changes';
+
+/** `custom` 事件 `data.payload` 的形狀。 */
+export interface WorkspaceChangesPayload {
+  /** 那顆 `workspace/changes` 在 root 日誌裡的 `seq`，兩條路由拿它定位摘要。 */
+  readonly seq: number;
+}
+
+/**
+ * 一輪改動摘要的路徑，`GET`，帶 `?seq=`。
+ * @param threadId - thread id，就是 root 會話的 id。
+ * @returns 路徑。
+ */
+export function changesSummaryPath(threadId: string): string {
+  return `/threads/${encodeURIComponent(threadId)}/changes/summary`;
+}
+
+/**
+ * 一個列出的檔的比較，`GET`，帶 `?seq=&index=`（`index` 是它在摘要 `files` 裡的位置）。
+ * @param threadId - thread id，就是 root 會話的 id。
+ * @returns 路徑。
+ */
+export function changesDiffPath(threadId: string): string {
+  return `/threads/${encodeURIComponent(threadId)}/changes/diff`;
+}
+
+/**
+ * 一輪改動摘要的網址（路徑加查詢），`GET`。
+ *
+ * **查詢怎麼拼歸 wire**（[#684](https://github.com/DemianLi/nexus-agent/issues/684)），照 dsh
+ * `packages/client/ui-deliverables/src/changes.ts` 的 URL builder：用 `URLSearchParams` 拼，參數名住在這一處，
+ * web 與 harness 的測試都從這裡拿。參數名兩邊各拼一份的時候，harness 把它改名、連自己的測試一起改，
+ * web 照舊送舊名，server 回 400，兩邊的測試照樣綠。
+ *
+ * @param threadId - thread id，就是 root 會話的 id。
+ * @param seq - 那顆 `workspace/changes` 在 root 日誌裡的 `seq`。
+ * @returns 相對的網址，不含 base。
+ */
+export function changesSummaryUrl(threadId: string, seq: number): string {
+  return `${changesSummaryPath(threadId)}?${new URLSearchParams({ seq: String(seq) })}`;
+}
+
+/**
+ * 一個列出的檔的比較的網址（路徑加查詢），`GET`。理由同 {@link changesSummaryUrl}。
+ *
+ * @param threadId - thread id，就是 root 會話的 id。
+ * @param seq - 同 {@link changesSummaryUrl}。
+ * @param index - 那個檔在摘要 `files` 裡的位置。
+ * @returns 相對的網址，不含 base。
+ */
+export function changesDiffUrl(threadId: string, seq: number, index: number): string {
+  return `${changesDiffPath(threadId)}?${new URLSearchParams({
+    seq: String(seq),
+    index: String(index),
+  })}`;
+}
+
+function isChangedFile(value: unknown): value is WorkspaceChangedFile {
+  const file = value as Partial<WorkspaceChangedFile> | null;
+  return (
+    typeof file?.path === 'string' &&
+    typeof file.display === 'string' &&
+    typeof file.added === 'number' &&
+    typeof file.deleted === 'number'
+  );
+}
+
+/**
+ * `changes/summary` 回應的形狀檢查，同 dsh `isChangesSummary`：對不上就當成沒有，不讓半截的東西進畫面。
+ * 從 web 原樣搬來（#684），不順手收緊。
+ */
+export function isChangesSummary(value: unknown): value is WorkspaceChangesSummary {
+  const summary = value as Partial<WorkspaceChangesSummary> | null;
+  return (
+    Array.isArray(summary?.files) &&
+    summary.files.every(isChangedFile) &&
+    typeof summary.total === 'number' &&
+    typeof summary.added === 'number' &&
+    typeof summary.deleted === 'number'
+  );
+}
+
+function isHunk(value: unknown): value is WorkspaceDiffHunk {
+  const hunk = value as Partial<WorkspaceDiffHunk> | null;
+  return (
+    [hunk?.oldStart, hunk?.oldLines, hunk?.newStart, hunk?.newLines].every(
+      (field) => Number.isSafeInteger(field) && (field as number) >= 0,
+    ) &&
+    Array.isArray(hunk?.lines) &&
+    hunk.lines.every((line) => typeof line === 'string' && /^[+ -]/.test(line))
+  );
+}
+
+/**
+ * `changes/diff` 回應的形狀檢查，同 dsh `isChangesDiff`：對不上就當成讀壞了。
+ * 從 web 的 `isFileDiff` 原樣搬來（#684），名字照 dsh。
+ */
+export function isChangesDiff(value: unknown): value is WorkspaceFileDiff {
+  const diff = value as Record<string, unknown> | null;
+  if (typeof diff?.path !== 'string' || diff.path === '') return false;
+  if (typeof diff.display !== 'string' || diff.display === '') return false;
+  if (diff.kind === 'binary' || diff.kind === 'oversized') return true;
+  return (
+    diff.kind === 'text' &&
+    typeof diff.before === 'boolean' &&
+    typeof diff.after === 'boolean' &&
+    typeof diff.coarse === 'boolean' &&
+    Array.isArray(diff.hunks) &&
+    diff.hunks.every(isHunk)
+  );
+}
+
+// 名字→酬載表（#685）上屬於這個檔的格子，見 `custom-frame.ts`。
+declare module './custom-frame.js' {
+  interface CustomFramePayloads {
+    [WORKSPACE_CHANGES]: WorkspaceChangesPayload;
+  }
+}

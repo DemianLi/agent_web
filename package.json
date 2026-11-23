@@ -1,0 +1,41 @@
+{
+  "name": "agent-web",
+  "version": "0.6.2",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "lint": "pnpm run build:lib && pnpm -r run lint",
+    "typecheck": "pnpm -r --filter './harness/packages/*' --filter ./web run typecheck",
+    "test": "pnpm -r run test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "dev": "pnpm --filter @nexus/web run dev",
+    "build": "pnpm run build:lib && pnpm -r run build",
+    "build:lib": "tsdown",
+    "gen-tsconfig-paths": "tsx harness/scripts/gen-tsconfig-paths.ts",
+    "verify-tsconfig-paths": "tsx harness/scripts/gen-tsconfig-paths.ts --check",
+    "verify-lib-manifests": "tsx harness/scripts/verify-lib-manifests.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.0",
+    "@types/spdx-expression-parse": "^4.0.0",
+    "eslint": "^9.39.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
+    "spdx-expression-parse": "^5.0.0",
+    "tsdown": "^0.22.2",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.0",
+    "vite-tsconfig-paths": "^6.1.1"
+  },
+  "pnpm": {
+    "overrides": {
+      "mout@<1.2.4": "^1.2.4"
+    }
+  }
+}

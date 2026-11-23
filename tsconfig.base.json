@@ -1,0 +1,58 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "paths": {
+      // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
+      "@nexus/brand": ["./harness/packages/nexus-brand/src/index.ts"],
+      "@nexus/core": ["./harness/packages/nexus-core/src/index.ts"],
+      "@nexus/core/approval-gate": ["./harness/packages/nexus-core/src/approval.ts"],
+      "@nexus/core/invariant": ["./harness/packages/nexus-core/src/invariant.ts"],
+      "@nexus/core/model-usage": ["./harness/packages/nexus-core/src/model-usage.ts"],
+      "@nexus/core/observation-policy": ["./harness/packages/nexus-core/src/observation.ts"],
+      "@nexus/core/repeat-reminder": ["./harness/packages/nexus-core/src/repeat-reminder.ts"],
+      "@nexus/core/session-checkpoint-policy": [
+        "./harness/packages/nexus-core/src/session-checkpoint-policy.ts"
+      ],
+      "@nexus/core/session-persistence": [
+        "./harness/packages/nexus-core/src/session-persistence.ts"
+      ],
+      "@nexus/core/summarization": ["./harness/packages/nexus-core/src/summarization.ts"],
+      "@nexus/core/tool-result-pruner": ["./harness/packages/nexus-core/src/tool-result-pruner.ts"],
+      "@nexus/plugin-commands": ["./harness/packages/nexus-plugin-commands/src/index.ts"],
+      "@nexus/plugin-commands/invariant": [
+        "./harness/packages/nexus-plugin-commands/src/invariant.ts"
+      ],
+      "@nexus/plugin-workspace-changes": [
+        "./harness/packages/nexus-plugin-workspace-changes/src/index.ts"
+      ],
+      "@nexus/plugin-workspace-changes/types": [
+        "./harness/packages/nexus-plugin-workspace-changes/src/types.ts"
+      ],
+      "@nexus/plugin-workspace-changes/invariant": [
+        "./harness/packages/nexus-plugin-workspace-changes/src/invariant.ts"
+      ],
+      "@nexus/sdk": ["./harness/packages/nexus-sdk/src/index.ts"],
+      "@nexus/sdk/lint": ["./harness/packages/nexus-sdk/src/lint.ts"],
+      "@nexus/subprocess": ["./harness/packages/nexus-subprocess/src/index.ts"],
+      "@nexus/timeout": ["./harness/packages/nexus-timeout/src/index.ts"],
+      "@nexus/tools": ["./harness/packages/nexus-tools/src/index.ts"],
+      "@nexus/tools/provider": ["./harness/packages/nexus-tools/src/provider.ts"],
+      "@nexus/wire": ["./harness/packages/nexus-wire/src/index.ts"]
+      // END generated package aliases
+    }
+  }
+}

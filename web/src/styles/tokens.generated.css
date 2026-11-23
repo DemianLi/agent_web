@@ -1,0 +1,58 @@
+/* 由 tokengen/generate.mjs 產生，不要手改。只放要覆寫 solid-glass 的 token，亮暗成對（#1512）。 */
+
+:root {
+  --brand: oklch(0.467 0.098 165);
+  --destructive: oklch(0.45 0.183 27.325);
+  --success: oklch(0.454 0.119 152);
+  --status-done: oklch(0.467 0.125 248);
+  --status-interrupted: oklch(0.476 0.113 58);
+  --status-running: oklch(0.468 0 0);
+  --link: oklch(0.483 0.159 255);
+  --card: oklch(0.981 0.004 265 / 60%);
+  --border: oklch(0.294 0.02 265 / 13%);
+  --ring: oklch(0.16 0 0);
+  --sidebar-ring: oklch(0.16 0 0);
+}
+
+.dark {
+  --brand: oklch(0.78 0.13 166);
+  --destructive: oklch(0.765 0.139 22.216);
+  --success: oklch(0.74 0.16 152);
+  --status-done: oklch(0.68 0.15 250);
+  --status-interrupted: oklch(0.77 0.15 62);
+  --status-running: oklch(0.72 0 0);
+  --link: oklch(0.76 0.12 250);
+  --card: oklch(0.31 0 0 / 46%);
+  --border: oklch(1 0 0 / 11%);
+  --ring: oklch(0.985 0 0);
+  --sidebar-ring: oklch(0.985 0 0);
+}
+
+/* reduced-transparency：上面覆寫了的照樣重寫（不然無條件的值會蓋掉不透明值），亮暗鑑別度不夠的照 1b 解過。 */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --card: oklch(0.958 0.005 265);
+    --sidebar: oklch(0.952 0 0);
+  }
+  .dark {
+    --card: oklch(0.225 0 0);
+    --sidebar: oklch(0.13 0 0);
+  }
+}
+
+/* data-glass="opaque"：面換成不透明，跟 reduced-transparency 同一組值（#1468 Q7；本地修改，見 vendor/solid-glass/README.md）。 */
+[data-glass='opaque'] {
+  --primary-solid: 100%;
+  --panel: oklch(0.947 0.006 265);
+  --card: oklch(0.958 0.005 265);
+  --popover: oklch(0.98 0.003 265);
+  --sidebar: oklch(0.952 0 0);
+}
+.dark[data-glass='opaque'],
+.dark [data-glass='opaque'] {
+  --primary-solid: 100%;
+  --panel: oklch(0.19 0 0);
+  --card: oklch(0.225 0 0);
+  --popover: oklch(0.22 0 0);
+  --sidebar: oklch(0.13 0 0);
+}

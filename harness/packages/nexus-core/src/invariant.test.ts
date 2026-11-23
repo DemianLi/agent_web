@@ -1,0 +1,495 @@
+/**
+ * `@nexus/core` 的會話配套入口：turn 配對。
+ *
+ * 對應 [#101](https://github.com/DemianLi/nexus-agent/issues/101) 的驗收：合法序列不吵、
+ * `turn/start` 疊在開著的輪上被抓到、`interrupt/raised` 落在輪外被抓到。
+ *
+ * **合法序列那幾條是照兩個生產者實際發的順序寫的**（`thread-pump.ts` 的 `#runOnce`、
+ * `cli.ts` 的 `runTurn`），不是照型別想出來的——會在真流量上誤報的檢查比沒有檢查更糟。
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { createInvariantRunner } from './invariants.js';
+import type { InvariantCompanion, InvariantError } from './invariants.js';
+import { createRegistry } from './registry.js';
+import { SessionLog } from './session-log.js';
+import { coreInvariantPlugin, CORE_INVARIANT_PACKAGE } from './invariant.js';
+import { sessionInvariant } from './invariant.js';
+
+/** 接上配套入口，回傳收到的違規。 */
+function watch(log: SessionLog): InvariantError[] {
+  const violations: InvariantError[] = [];
+  const companion: InvariantCompanion = {
+    packageName: CORE_INVARIANT_PACKAGE,
+    installer: sessionInvariant,
+    origin: { id: 'core-invariant#0', name: 'core-invariant' },
+  };
+  createInvariantRunner({
+    log,
+    companions: [companion],
+    onViolation: (error) => violations.push(error),
+    warn: (message) => {
+      throw new Error(`不該有 warn：${message}`);
+    },
+  });
+  return violations;
+}
+
+describe('合法序列不吵', () => {
+  it('走 default 分支的種類不參與 turn 配對——輪內輪外都不吵', () => {
+    // 這一條釘的是 `sessionInvariant` 的 `default` 分支：**後來加的事件種類歸它們自己的
+    // 擁有者**（goal 的耐久串由 `@nexus/plugin-goal` 的配套入口檢），這裡多管一句就會在
+    // 真流量上誤報。核心不能 import plugin，所以用核心自己的種類 `model/usage` 站同一個位置。
+    const log = new SessionLog('default-不干擾');
+    const violations = watch(log);
+    const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 } as const;
+    log.append('model/usage', usage);
+    log.append('turn/start', { kind: 'message', text: '走吧' });
+    log.append('model/usage', usage);
+    log.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('CLI 那條：turn/start → turn/end', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '嗨' });
+    log.append('turn/end', {});
+
+    expect(violations).toEqual([]);
+  });
+
+  it('核准那條：turn/start → interrupt/raised → turn/end → resume 的新一輪', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+    log.append('turn/end', {});
+    log.append('turn/start', { kind: 'resume' });
+    log.append('turn/end', {});
+
+    expect(violations).toEqual([]);
+  });
+
+  it('失敗那條：turn/failed 收工，下一輪照樣開得起來', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '嗨' });
+    log.append('turn/failed', { message: '模型建不起來' });
+    log.append('turn/start', { kind: 'message', text: '再試' });
+    log.append('turn/end', {});
+
+    expect(violations).toEqual([]);
+  });
+
+  it('一輪裡多顆中斷不算違規（pump 的 #translate 一次可以發好幾顆）', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '批次' });
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+    log.append('interrupt/raised', { interruptId: 'i-2' });
+    log.append('turn/end', {});
+
+    expect(violations).toEqual([]);
+  });
+
+  it('日誌結尾還有一輪開著不算違規——那跟「跑到一半」分不出來', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '跑很久' });
+
+    expect(violations).toEqual([]);
+  });
+});
+
+describe('三條關係', () => {
+  it('turn/start 疊在開著的輪上', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'message', text: '第一輪' });
+    log.append('turn/start', { kind: 'message', text: '第二輪' });
+
+    expect(violations).toHaveLength(1);
+    expect(violations[0]!.packageName).toBe('@nexus/core');
+    expect(violations[0]!.message).toContain('上一輪還開著');
+    expect(violations[0]!.message).toContain('seq 1');
+  });
+
+  it('turn/end 關了一個沒開的輪', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/end', {});
+
+    expect(violations).toHaveLength(1);
+    expect(violations[0]!.message).toContain('關了一個沒有開著的輪');
+  });
+
+  it('turn/failed 關了一個沒開的輪', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'resume' });
+    log.append('turn/end', {});
+    log.append('turn/failed', { message: '收尾時炸了' });
+
+    expect(violations).toHaveLength(1);
+    expect(violations[0]!.message).toContain('turn/failed');
+  });
+
+  it('interrupt/raised 落在任何開著的輪之外', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+
+    expect(violations).toHaveLength(1);
+    expect(violations[0]!.message).toContain('落在任何開著的輪之外');
+  });
+
+  it('一次違規之後狀態照樣往前走，不會卡住不再報', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+
+    log.append('turn/start', { kind: 'resume' });
+    log.append('turn/start', { kind: 'resume' });
+    log.append('turn/end', {});
+    log.append('turn/end', {});
+
+    expect(violations).toHaveLength(2);
+    expect(violations[1]!.message).toContain('關了一個沒有開著的輪');
+  });
+});
+
+/**
+ * 工具事件的 `callId` 配對（[#264](https://github.com/DemianLi/nexus-agent/issues/264)）。合法序列
+ * 照圍堵實際發的順序寫：呼叫在前、結果在後；被中斷的那次 resume 之後以同一個 `callId` 再記一顆。
+ */
+describe('tool/call ↔ tool/result 配對', () => {
+  const callOf = (callId: string) => ({ callId, name: 'probe', arguments: '{}' });
+
+  it('一對一對、併發交錯都不吵', () => {
+    const log = new SessionLog('tools');
+    const violations = watch(log);
+    log.append('tool/call', callOf('a'));
+    log.append('tool/call', callOf('b'));
+    log.append('tool/result', { callId: 'b', isError: false });
+    log.append('tool/result', { callId: 'a', isError: true });
+    expect(violations).toEqual([]);
+  });
+
+  it('被中斷的那次：同一個 callId 兩顆呼叫、一顆結果，不吵', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('tool/call', callOf('a'));
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+    log.append('turn/end', {});
+    log.append('turn/start', { kind: 'resume' });
+    log.append('tool/call', callOf('a'));
+    log.append('tool/result', { callId: 'a', isError: false });
+    log.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('結果前面沒有呼叫 → 報', () => {
+    const log = new SessionLog('tools');
+    const violations = watch(log);
+    log.append('tool/result', { callId: 'ghost', isError: false });
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('callId "ghost" 前面沒有還沒配到的 tool/call'),
+    ]);
+  });
+
+  it('同一顆呼叫配第二次 → 報', () => {
+    const log = new SessionLog('tools');
+    const violations = watch(log);
+    log.append('tool/call', callOf('a'));
+    log.append('tool/result', { callId: 'a', isError: false });
+    log.append('tool/result', { callId: 'a', isError: false });
+    expect(violations).toHaveLength(1);
+  });
+
+  it('上一個行程中斷的那次：續接之後重記一顆再落定，不吵', () => {
+    const earlier = new SessionLog('web');
+    earlier.append('tool/call', callOf('a'));
+    const resumed = new SessionLog('web', { seed: earlier.events });
+    const violations = watch(resumed);
+    resumed.append('tool/call', callOf('a'));
+    resumed.append('tool/result', { callId: 'a', isError: false });
+    expect(violations).toEqual([]);
+  });
+
+  it('**end-seed 之前的呼叫不替之後的結果背書**', () => {
+    const earlier = new SessionLog('web');
+    earlier.append('tool/call', callOf('a'));
+    const resumed = new SessionLog('web', { seed: earlier.events });
+    const violations = watch(resumed);
+    resumed.append('tool/result', { callId: 'a', isError: false });
+    expect(violations).toHaveLength(1);
+  });
+});
+
+/** [#266](https://github.com/DemianLi/nexus-agent/issues/266)：只檢結尾那一側，理由見 `invariant.ts`。 */
+describe('model/start ↔ model/end', () => {
+  it('一對一對、以及一顆沒結尾的開頭都不吵', () => {
+    const log = new SessionLog('models');
+    const violations = watch(log);
+    log.append('model/start', {});
+    log.append('model/end', {});
+    log.append('model/start', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('結尾前面沒有開頭 → 報', () => {
+    const log = new SessionLog('models');
+    const violations = watch(log);
+    log.append('model/start', {});
+    log.append('model/end', {});
+    log.append('model/end', {});
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('model/end（seq 2）前面沒有開著的 model/start'),
+    ]);
+  });
+
+  /** [#1021](https://github.com/DemianLi/nexus-agent/issues/1021)：`modelCall` 要指到前面真的有的 `model/start`。 */
+  it('指向前面的 model/start 不吵：包括呼叫結束之後才寫的量測與被切斷的半段', () => {
+    const log = new SessionLog('models');
+    const violations = watch(log);
+    log.append('model/start', {}); // 0
+    log.append('model/end', { modelCall: 0 });
+    log.append('context/measure', {
+      approxTokens: 1,
+      messageCount: 1,
+      thresholds: [],
+      modelCall: 0,
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it('指向不存在或不是 model/start 的 seq → 報', () => {
+    const log = new SessionLog('models');
+    const violations = watch(log);
+    log.append('model/start', {}); // 0
+    log.append('model/usage', { inputTokens: 1, outputTokens: 1, totalTokens: 2, modelCall: 7 });
+    log.append('model/end', { modelCall: 1 }); // seq 1 是上面那顆 usage，不是開頭
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('model/usage（seq 1）的 modelCall 7'),
+      expect.stringContaining('model/end（seq 2）的 modelCall 1'),
+    ]);
+  });
+
+  it('**end-seed 之前沒結尾的開頭，不替之後的結尾背書**', () => {
+    const earlier = new SessionLog('models');
+    earlier.append('model/start', {});
+    const resumed = new SessionLog('models', { seed: earlier.events });
+    const violations = watch(resumed);
+    resumed.append('model/end', {});
+    expect(violations).toHaveLength(1);
+  });
+});
+
+describe('plugin', () => {
+  it('掛上去就認領 @nexus/core 這個名字', () => {
+    const registry = createRegistry();
+    const exit = registry.enter({ id: 'core-invariant#0', name: 'core-invariant' });
+    coreInvariantPlugin.apply(registry);
+    exit();
+
+    const companions = registry.invariants.companions();
+    expect(companions).toHaveLength(1);
+    expect(companions[0]!.packageName).toBe('@nexus/core');
+  });
+});
+
+/**
+ * 續接：**seed 結尾那一輪開著，是上一個行程跑到一半，不是這個行程的違規**
+ * （[#251](https://github.com/DemianLi/nexus-agent/issues/251) 的門 A）。
+ */
+describe('在 `session/end-seed` 重設', () => {
+  it('上一個行程當在輪中，續接之後的第一顆 `turn/start` 不吵', () => {
+    const earlier = new SessionLog('cli');
+    earlier.append('turn/start', { kind: 'message', text: '跑到一半' });
+    const resumed = new SessionLog('cli', { seed: earlier.events });
+    const violations = watch(resumed);
+    resumed.append('turn/start', { kind: 'message', text: '接著來' });
+    resumed.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  /** 反例：拿掉 end-seed 那一格重設的話就是這個樣子——同一串事件不經 seed。 */
+  it('反例：同一串事件不經 seed，第二顆 `turn/start` 照樣報', () => {
+    const log = new SessionLog('cli');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '跑到一半' });
+    log.append('turn/start', { kind: 'message', text: '接著來' });
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('turn/start（seq 1）來的時候上一輪還開著'),
+    ]);
+  });
+
+  it('重設不放過這個行程自己的違規：end-seed 之後的輪照樣要配對', () => {
+    const resumed = new SessionLog('cli', { seed: [] });
+    const violations = watch(resumed);
+    resumed.append('turn/start', { kind: 'message', text: '一' });
+    resumed.append('turn/start', { kind: 'message', text: '二' });
+    expect(violations).toHaveLength(1);
+  });
+});
+
+describe('送出佇列（#637）', () => {
+  const item = (id: string) => ({ id, text: id, source: { kind: 'user' as const } });
+
+  it('合規的插、領、改、刪不吵；停在核准點時插進來的也不吵', () => {
+    const log = new SessionLog('s');
+    const violations = watch(log);
+    log.append('inbox/spliced', { target: 'next-turn', start: 0, inserted: [item('a')] });
+    log.append('turn/start', { kind: 'message', text: 'a' });
+    log.append('inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] });
+    log.append('interrupt/raised', { interruptId: 'i1' });
+    log.append('turn/end', {});
+    log.append('inbox/spliced', { target: 'next-turn', start: 0, inserted: [item('b')] });
+    log.append('inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      removedCount: 1,
+      inserted: [item('b')],
+      outcome: 'canceled',
+    });
+    log.append('turn/start', { kind: 'resume' });
+    log.append('turn/end', {});
+    log.append('inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      removedCount: 1,
+      inserted: [],
+      outcome: 'canceled',
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it('領一件不存在的、插一件同 id 的：各抓一次', () => {
+    const log = new SessionLog('s');
+    const violations = watch(log);
+    log.append('inbox/spliced', { target: 'next-turn', start: 0, removedCount: 1, inserted: [] });
+    log.append('inbox/spliced', { target: 'next-turn', start: 0, inserted: [item('a')] });
+    log.append('inbox/spliced', { target: 'next-turn', start: 1, inserted: [item('a')] });
+    expect(violations.map((violation) => violation.message)).toEqual([
+      expect.stringContaining('inbox/spliced（seq 0）不合規'),
+      expect.stringContaining('inbox/spliced（seq 2）不合規'),
+    ]);
+  });
+
+  it('跨 session/end-seed 不重設：重啟之後領上一個行程排的那件不是違規', () => {
+    const first = new SessionLog('s');
+    first.append('inbox/spliced', { target: 'next-turn', start: 0, inserted: [item('a')] });
+    const resumed = new SessionLog('s', { seed: first.events });
+    const violations = watch(resumed);
+    resumed.append('turn/start', { kind: 'message', text: 'a' });
+    resumed.append('inbox/spliced', {
+      target: 'next-turn',
+      start: 0,
+      removedCount: 1,
+      inserted: [],
+    });
+    resumed.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+});
+
+describe('核准稽核落在開著的輪內（#2026）', () => {
+  const asked = (log: SessionLog, id: string) =>
+    log.append('approval/asked', { id, toolName: 'danger', callId: `call-${id}` });
+  const decided = (log: SessionLog, id: string, outcome: 'allowed-once' | 'cancelled') =>
+    log.append('approval/decided', { id, outcome });
+
+  it('輪外的 approval/asked 報違規', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('turn/end', {});
+    asked(log, 'a-1');
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('approval/asked（seq 2）落在任何開著的輪之外'),
+    ]);
+  });
+
+  it('輪外的 approval/decided 報違規', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('turn/end', {});
+    decided(log, 'a-1', 'allowed-once');
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('approval/decided（seq 2）落在任何開著的輪之外'),
+    ]);
+  });
+
+  it('政策路徑：同一輪裡一對 asked／decided 夾在 tool/call 與 tool/result 之間', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('tool/call', { callId: 'call-a-1', name: 'danger', arguments: '{}' });
+    asked(log, 'a-1');
+    log.append('approval/decided', { id: 'a-1', outcome: 'rejected' });
+    log.append('tool/result', { callId: 'call-a-1', isError: true });
+    log.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('沒有輪的日誌（前景子代理的形狀）：不判', () => {
+    // 前景子代理的日誌沒有 `turn/*`；政策路徑把稽核寫進子代理自己那份日誌（呼叫者就是子代理）。
+    const log = new SessionLog('web/tools:1');
+    const violations = watch(log);
+    log.append('tool/call', { callId: 'call-a-1', name: 'danger', arguments: '{}' });
+    asked(log, 'a-1');
+    log.append('approval/decided', { id: 'a-1', outcome: 'rejected' });
+    log.append('tool/result', { callId: 'call-a-1', isError: true });
+    expect(violations).toEqual([]);
+  });
+
+  it('人那條跨兩輪：提問那一輪記 asked，續接那一輪的 turn/start 之後記 decided', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+    asked(log, 'i-1');
+    log.append('turn/end', {});
+    log.append('turn/start', { kind: 'resume' });
+    decided(log, 'i-1', 'allowed-once');
+    log.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('人那條被收回：收回那一輪的 turn/start 之後記 decided（cancelled）', () => {
+    const log = new SessionLog('web');
+    const violations = watch(log);
+    log.append('turn/start', { kind: 'message', text: '刪檔' });
+    log.append('interrupt/raised', { interruptId: 'i-1' });
+    asked(log, 'i-1');
+    log.append('turn/end', {});
+    log.append('turn/start', { kind: 'resume' });
+    decided(log, 'i-1', 'cancelled');
+    log.append('turn/end', {});
+    expect(violations).toEqual([]);
+  });
+
+  it('跨 session/end-seed 不重設：續接之後輪外的稽核照樣報', () => {
+    const earlier = new SessionLog('web');
+    earlier.append('turn/start', { kind: 'message', text: '刪檔' });
+    earlier.append('turn/end', {});
+    const resumed = new SessionLog('web', { seed: earlier.events });
+    const violations = watch(resumed);
+    asked(resumed, 'a-1');
+    expect(violations.map((error) => error.message)).toEqual([
+      expect.stringContaining('approval/asked'),
+    ]);
+  });
+});

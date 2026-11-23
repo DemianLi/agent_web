@@ -1,0 +1,675 @@
+/**
+ * git 工作樹快照、樹與樹的比較、忽略判斷。
+ *
+ * ## git 怎麼起由組裝點決定
+ *
+ * 起行程的介面（{@link GitStarter}）定在這個套件，產品由 harness 經 {@link GIT_STARTER_SERVICE} 注入：Linux 上走沙箱 spawner
+ * （[#1946](https://github.com/DemianLi/nexus-agent/issues/1946)），其他平台沒有沙箱後端，會話是 `danger-full-access` 時才拍得了快照，由 harness 直接 spawn。
+ * {@link directGitStarter} 直接 spawn，只給測試。前三條不論經哪個 starter 都在這個檔裡做，第四條看 starter：
+ *
+ * - **環境**：`scrubbedParentEnv()`，定義在 core 的 `child-env.ts`（#726）、經 `@nexus/subprocess` 轉出，跟 MCP 的 stdio server
+ *   共用一份：拿掉名字像憑證的與 `NEXUS_*` 變數，行程裝了代理時疊上代理那一層（#746），git 快照的環境自然帶著。git 自己不看
+ *   那層裡的 `NODE_USE_ENV_PROXY`、只讀代理變數，快照又不碰網路，所以這一層對今天的 git 呼叫沒有可觀察的效果——跟著共用函式走，
+ *   是為了將來哪個 git 底下的 Node 工具（hook、credential helper）連外時跟父行程走同一條路；這只在直接 spawn 的路徑上有意義，
+ *   經 spawner 的子行程連不了網路（seccomp 擋 `AF_INET`）。
+ * - **逾時、輸出上限與管線排空**：{@link GitRunner.run} 自己做逾時、stdout 位元組上限（保留尾端）與管線排空。`run` 以
+ *   {@link GitProcess.exited} 為界、到 {@link TERMINATE_GRACE_MS} 銷毀 stdout／stderr、用它的結束碼結算（#1560 N1110），不等後代
+ *   把 pipe 關掉；只等 `done` 的話，後代（會自己 fork 背景行程的 clean filter、fsmonitor）握著管線時 `run` 永遠不回來，recorder
+ *   的 dispose 與 thread 的閒置逐出都會等它。
+ * - **找執行檔**：{@link resolveGitExecutable} 在淨化過的 `PATH` 裡找。
+ * - **行程結束時同步強殺**（[#1542](https://github.com/DemianLi/nexus-agent/issues/1542)）：serve 被強制結束時 git 的逾時沒人數，
+ *   還在跑的 git 會留成孤兒。經 spawner 時由 spawner 收掉整個行程群組；直接 spawn 的（harness 的 `directToolLauncher` 與
+ *   {@link directGitStarter}）登記進 `trackHostExitChild`，只殺直接子行程。
+ *
+ * ## 私有 index 保留原本的時間戳
+ *
+ * `snapshotTree` 把 repo 的 index 複製一份當種子，並把副本的時間戳設回原本的。**git 判斷一個 index 項目要不要重讀內容，看的是
+ * index 檔自己的 mtime**（racy git：項目的 mtime 不早於 index 的，就不信 stat）。副本一旦比原本的新，一個跟上次寫 index 同一秒改、
+ * 大小沒變的檔，stat 看起來跟快取一樣，`git add` 就不讀它，那次改動從快照裡消失。實測 git 2.50.1：commit 後立刻改同大小的檔、
+ * 隔一秒再拍，新時間戳的副本三次都漏、保留時間戳的三次都看得到（Node 的 `copyFile` 在 macOS 與 Linux 上都不保留 mtime）。保留時間戳，
+ * git 在副本上做的判斷才跟在真的 index 上一樣。
+ *
+ * @module
+ */
+
+import { spawn } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access, copyFile, mkdir, mkdtemp, rm, stat, utimes } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { delimiter, isAbsolute, join, relative, resolve } from 'node:path';
+
+import { scrubbedParentEnv, trackHostExitChild } from '@nexus/subprocess';
+import { deadline, timeoutOf } from '@nexus/timeout';
+import type { Readable } from 'node:stream';
+
+import { parseNumstat } from './numstat.js';
+import type { NumstatEntry } from './numstat.js';
+import { canonicalPath, isInside, toPosix } from './paths.js';
+
+/** 逾時的 `TimeoutReason.code`；`timeoutOf` 靠它分辨「自己這顆逾時」與上游的中止。 */
+const GIT_TIMEOUT_CODE = 'GIT_TIMEOUT';
+
+/** 開始收掉之後，git 子行程還有幾毫秒可以自己結束；固定的生命週期常數，不進 {@link GitLimits}。 */
+const TERMINATE_GRACE_MS = 2_000;
+/** 留下來診斷用的 stderr 尾端。 */
+const STDERR_TAIL_BYTES = 16 * 1024;
+
+/** 一次 git 指令落定的結果；非零的結束碼是結果，不是例外。 */
+export interface GitRunResult {
+  readonly exitCode: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  /** stdout 超過上限、丟掉了開頭。 */
+  readonly truncated: boolean;
+}
+
+/** 一次指令的參數。 */
+export interface GitRunOptions {
+  readonly cwd: string;
+  readonly env?: Readonly<Record<string, string>>;
+  readonly stdin?: string;
+  /** 這一次要寫的根，省略就是不寫檔。 */
+  readonly writable?: readonly string[];
+  /** 這一次的 stdout 上限，蓋掉 runner 的 `outputMaxBytes`。 */
+  readonly maxBytes?: number;
+  readonly signal: AbortSignal;
+}
+
+/** 每一次 git 指令的界限。 */
+export interface GitLimits {
+  /** 幾毫秒之後收掉。 */
+  readonly timeoutMs: number;
+  /** stdout 留在記憶體裡的位元組上限。 */
+  readonly outputMaxBytes: number;
+}
+
+/** 只留最後 `max` 個位元組的收集器：超過上限就丟開頭。 */
+class TailBuffer {
+  #chunks: Buffer[] = [];
+  #bytes = 0;
+  truncated = false;
+
+  constructor(private readonly max: number) {}
+
+  push(chunk: Buffer): void {
+    this.#chunks.push(chunk);
+    this.#bytes += chunk.length;
+    while (this.#bytes > this.max) {
+      const head = this.#chunks[0]!;
+      const excess = this.#bytes - this.max;
+      this.truncated = true;
+      if (head.length <= excess) {
+        this.#chunks.shift();
+        this.#bytes -= head.length;
+      } else {
+        this.#chunks[0] = head.subarray(excess);
+        this.#bytes -= excess;
+      }
+    }
+  }
+
+  text(): string {
+    return Buffer.concat(this.#chunks).toString('utf8');
+  }
+}
+
+/** git 沒有跑起來的原因。沙箱不可用與 repo 根包住 `$HOME` 要跟 git 自己起不來分開：前兩者那一輪不記也不報錯，下一輪重試。 */
+export type GitStartFailure =
+  'sandbox-unavailable' | 'repo-covers-home' | 'start-dir' | 'not-found' | 'launch-failed';
+
+/** 一次執行的結局。 */
+export type GitOutcome =
+  | { readonly kind: 'exited'; readonly code: number | null }
+  | { readonly kind: 'failed'; readonly reason: GitStartFailure };
+
+/** 起一次 git 要的東西。 */
+export interface GitStart {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  /** 子行程的環境就是這一份。 */
+  readonly env: NodeJS.ProcessEnv;
+  /** 這一次要寫的根。 */
+  readonly writable: readonly string[];
+  readonly stdin?: string;
+}
+
+/** 起起來的 git。 */
+export interface GitProcess {
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  /** 已經結束時什麼都不做。 */
+  kill(signal: 'SIGTERM' | 'SIGKILL'): void;
+  /** 行程結束或沒起成就 settle，不等輸出。不會 reject。 */
+  readonly exited: Promise<GitOutcome>;
+  /** 輸出也讀完才 settle。不會 reject。 */
+  readonly done: Promise<GitOutcome>;
+}
+
+/** 起 git。不會 reject：起不來回 {@link GitStartFailure}。 */
+export type GitStarter = (start: GitStart) => Promise<GitProcess | GitStartFailure>;
+
+/** host 服務的名字。沒有這一格就當成沒有 git：不退回直接 spawn。 */
+export const GIT_STARTER_SERVICE = 'gitStarter';
+
+declare module '@nexus/core' {
+  interface NexusServices {
+    /** 組裝點交的起 git 的方式。見 {@link GIT_STARTER_SERVICE}。 */
+    gitStarter: GitStarter;
+  }
+}
+
+/** git 沒有起成。 */
+export class GitStartError extends Error {
+  /** `not-found` 時同 Node 的 spawn 錯誤。 */
+  readonly code: 'ENOENT' | undefined;
+
+  constructor(
+    readonly reason: GitStartFailure,
+    executable: string,
+  ) {
+    super(reason === 'not-found' ? `spawn ${executable} ENOENT` : `git could not start: ${reason}`);
+    this.code = reason === 'not-found' ? 'ENOENT' : undefined;
+  }
+}
+
+/** 直接 spawn，只給測試：產品一律走 {@link GIT_STARTER_SERVICE}。 */
+export const directGitStarter: GitStarter = (start) => {
+  const child = spawn(start.executable, [...start.args], {
+    cwd: start.cwd,
+    env: start.env,
+    stdio: [start.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  // 行程被強制結束時，這個 git 由 core 在 `'exit'` 上同步 SIGKILL（#1542）；自己結束了就拿掉。
+  const untrack = trackHostExitChild(child);
+  if (start.stdin !== undefined) {
+    // git 不讀完 stdin 就結束時寫入會 EPIPE；結果由結束碼決定。
+    child.stdin!.on('error', () => undefined);
+    child.stdin!.end(start.stdin);
+  }
+  const failed = new Promise<GitOutcome>((settle) => {
+    child.once('error', (error: NodeJS.ErrnoException) => {
+      untrack();
+      settle({
+        kind: 'failed',
+        reason: error.code === 'ENOENT' ? 'not-found' : 'launch-failed',
+      });
+    });
+  });
+  return Promise.resolve({
+    stdout: child.stdout!,
+    stderr: child.stderr!,
+    kill: (signal) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      // 起不來的 child 沒有 pid（'error' 事件還沒送到）：此時 `kill()` 會對 pid 0 送訊號，也就是整個行程群組（包括 serve 自己）
+      // （#1742）。'error' 隨後會把這一趟 reject。
+      if (child.pid === undefined) return;
+      child.kill(signal);
+    },
+    exited: Promise.race([
+      failed,
+      new Promise<GitOutcome>((settle) => {
+        child.once('exit', (code) => settle({ kind: 'exited', code }));
+      }),
+    ]),
+    done: Promise.race([
+      failed,
+      new Promise<GitOutcome>((settle) => {
+        child.once('close', (code) => {
+          untrack();
+          settle({ kind: 'exited', code });
+        });
+      }),
+    ]),
+  });
+};
+
+/** 用淨化過的環境、逾時與有上限的輸出跑一個解析好的 git 執行檔。 */
+export class GitRunner {
+  constructor(
+    private readonly executable: string,
+    private readonly limits: GitLimits,
+    private readonly start: GitStarter = directGitStarter,
+  ) {}
+
+  /**
+   * 跑 `git <args>` 到結束。
+   * @param args - git 參數，不經 shell。
+   * @param options - 工作目錄、額外環境、stdin 與取消。
+   * @returns 結束碼與收到的輸出。
+   * @throws 逾時、被中止，或 spawn 不起來。
+   */
+  async run(args: readonly string[], options: GitRunOptions): Promise<GitRunResult> {
+    // 取消與逾時融合成一顆 signal，**先到的那個決定原因**（`AbortSignal.any` 採用先中止的來源的 reason）：先被中止、
+    // 逾時的計時器之後才到期（git 收到 SIGTERM 之後還有 2 秒的 SIGKILL 寬限），`timeoutOf` 讀到的仍是中止，不會誤報逾時。
+    // 不能另外留著逾時那顆 signal、事後看 `timeout.aborted`：上面這個時序會報成「逾時」。
+    // `deadline` 把 `<= 0` 當成「不起計時器」；這裡的設定是 `z.number()`，0 或負數是設錯了，要拋，不能靜靜變成「永不逾時」。
+    if (!(this.limits.timeoutMs > 0)) {
+      throw new Error(`git timeoutMs 必須大於 0，收到 ${String(this.limits.timeoutMs)}`);
+    }
+    const bound = deadline(options.signal, this.limits.timeoutMs, GIT_TIMEOUT_CODE);
+    try {
+      return await this.#execute(args, options, bound.signal);
+    } finally {
+      bound[Symbol.dispose]();
+    }
+  }
+
+  async #execute(
+    args: readonly string[],
+    options: GitRunOptions,
+    signal: AbortSignal,
+  ): Promise<GitRunResult> {
+    const failure = (): Error =>
+      new Error(
+        `git ${args.join(' ')} ${timeoutOf(signal, GIT_TIMEOUT_CODE) !== undefined ? `timed out after ${this.limits.timeoutMs}ms` : 'was aborted'}`,
+      );
+    if (signal.aborted) throw failure();
+    const stdout = new TailBuffer(options.maxBytes ?? this.limits.outputMaxBytes);
+    const stderr = new TailBuffer(STDERR_TAIL_BYTES);
+    const started = await this.start({
+      executable: this.executable,
+      args,
+      cwd: options.cwd,
+      env: {
+        ...scrubbedParentEnv(),
+        // 淨化會拿掉 `GIT_CONFIG_KEY_<n>`，所以明著把環境裡的索引設定關掉。
+        GIT_CONFIG_COUNT: '0',
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_OPTIONAL_LOCKS: '0',
+        LC_ALL: 'C',
+        ...options.env,
+      },
+      writable: options.writable ?? [],
+      ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+    });
+    if (typeof started === 'string') throw new GitStartError(started, this.executable);
+    const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+      let exited = false;
+      let grace: NodeJS.Timeout | undefined;
+      const terminate = (): void => {
+        if (exited) return;
+        started.kill('SIGTERM');
+        grace = setTimeout(() => {
+          if (!exited) started.kill('SIGKILL');
+        }, TERMINATE_GRACE_MS);
+        grace.unref();
+      };
+      signal.addEventListener('abort', terminate, { once: true });
+      if (signal.aborted) terminate();
+      started.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+      started.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+      let settled = false;
+      let drain: NodeJS.Timeout | undefined;
+      const finish = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        signal.removeEventListener('abort', terminate);
+        clearTimeout(grace);
+        clearTimeout(drain);
+        return true;
+      };
+      // 'close' 要等 stdio 全關；後代行程（會自己 fork 背景行程的 clean filter、fsmonitor）繼承了管線的話，
+      // 直接子行程死了它也不來，逾時與 SIGKILL 殺的都是已經死掉的那一個。所以以結束為界：之後給管線
+      // 一段時間排空，到了就銷毀收集用的管線、用結束碼結算，不等後代（見檔頭「管線排空」）。
+      const settleWith = (outcome: GitOutcome): void => {
+        if (outcome.kind === 'failed') {
+          if (finish()) reject(new GitStartError(outcome.reason, this.executable));
+        } else if (finish()) {
+          resolveExit(outcome.code);
+        }
+      };
+      void started.exited.then((outcome) => {
+        exited = true;
+        if (outcome.kind === 'failed') {
+          settleWith(outcome);
+          return;
+        }
+        drain = setTimeout(() => {
+          started.stdout.destroy();
+          started.stderr.destroy();
+          settleWith(outcome);
+        }, TERMINATE_GRACE_MS);
+        drain.unref();
+      });
+      void started.done.then(settleWith);
+    });
+    if (signal.aborted) throw failure();
+    return { exitCode, stdout: stdout.text(), stderr: stderr.text(), truncated: stdout.truncated };
+  }
+}
+
+/**
+ * 找 git 執行檔，一個 plugin 實例找一次。在淨化過的 `PATH` 裡找。
+ * **macOS 上的 `/usr/bin/git` 是開發者工具的樁程序**，沒裝工具時會跳安裝視窗而不是跑，所以 `xcode-select -p`
+ * 不成功就當成沒有 git。
+ * @param options - 測試用：`PATH`、平台、樁程序的探測。
+ * @returns 執行檔路徑；沒有 git 時是 `null`。
+ */
+export async function resolveGitExecutable(
+  options: {
+    readonly path?: string | undefined;
+    readonly platform?: NodeJS.Platform;
+    readonly developerToolsSelected?: () => Promise<boolean>;
+  } = {},
+): Promise<string | null> {
+  const platform = options.platform ?? process.platform;
+  const names = platform === 'win32' ? ['git.exe', 'git'] : ['git'];
+  const directories = (options.path ?? scrubbedParentEnv()['PATH'] ?? '')
+    .split(delimiter)
+    .filter((directory) => directory !== '' && isAbsolute(directory));
+  let executable: string | undefined;
+  search: for (const directory of directories) {
+    for (const name of names) {
+      const candidate = join(directory, name);
+      try {
+        if (!(await stat(candidate)).isFile()) continue;
+        await access(candidate, constants.X_OK);
+        executable = candidate;
+        break search;
+      } catch {
+        // 不在、或不能執行：換下一個。
+      }
+    }
+  }
+  if (executable === undefined) return null;
+  if (platform !== 'darwin' || executable !== '/usr/bin/git') return executable;
+  const selected = await (options.developerToolsSelected ?? developerToolsSelected)();
+  return selected ? executable : null;
+}
+
+/** `xcode-select -p` 成功：開發者工具選好了，`/usr/bin/git` 不是樁。 */
+function developerToolsSelected(): Promise<boolean> {
+  return new Promise((resolveProbe) => {
+    const probe = spawn('/usr/bin/xcode-select', ['-p'], {
+      cwd: homedir(),
+      env: scrubbedParentEnv(),
+      stdio: 'ignore',
+      timeout: 10_000,
+    });
+    probe.once('error', () => resolveProbe(false));
+    probe.once('close', (code) => resolveProbe(code === 0));
+  });
+}
+
+/**
+ * 失敗的指令帶著 stderr 拋出來。
+ * @param result - 落定的結果。
+ * @param what - 錯誤訊息裡的指令描述。
+ * @returns 結束碼是零時原樣回傳。
+ */
+function ok(result: GitRunResult, what: string): GitRunResult {
+  if (result.exitCode !== 0) throw new Error(`${what} failed: ${result.stderr.trim()}`);
+  return result;
+}
+
+/** 包住工作區的那個 repo，與快照寫進去的私有目錄。 */
+export interface GitWorkspace {
+  /** repo 的頂層目錄，每一條 diff 路徑都相對它。 */
+  readonly root: string;
+  /** 放 repo 的 index 的 git 目錄（絕對路徑）。 */
+  readonly gitDir: string;
+  /** 私有目錄：快照的物件庫與每次快照的暫用 index。 */
+  readonly scratch: string;
+  /** 把物件寫到私有庫、經由 repo 的庫讀物件的環境。 */
+  readonly env: Readonly<Record<string, string>>;
+  /** 快照要跳過的工作樹路徑：暫存根落在工作樹裡時的那個私有目錄。 */
+  readonly excludes: readonly string[];
+}
+
+function isMissing(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT'
+  );
+}
+
+/**
+ * 找包住工作區的 repo，準備快照要寫的私有目錄。repo 自己的物件庫以唯讀 alternate 掛上，所以快照從那裡讀
+ * 已提交的內容、一個物件都不寫進去。私有目錄落在工作樹裡時（暫存根在工作區底下），每次快照都排除它。
+ * 不在任何 repo 裡回 `null`；其他 git 失敗照拋。
+ * @param git - runner。
+ * @param cwd - 標準化的工作區根。
+ * @param scratch - 給私有目錄；只有找到 repo 時才叫。
+ * @param signal - 取消。
+ * @returns repo；不在任何 repo 裡時是 `null`。
+ */
+export async function locateGitWorkspace(
+  git: GitRunner,
+  cwd: string,
+  scratch: () => Promise<string>,
+  signal: AbortSignal,
+): Promise<GitWorkspace | null> {
+  const found = await git.run(
+    ['rev-parse', '--show-toplevel', '--absolute-git-dir', '--git-path', 'objects'],
+    { cwd, signal },
+  );
+  if (found.exitCode === 128 && /not a git repository/i.test(found.stderr)) return null;
+  const [root, gitDir, repositoryObjects] = ok(found, 'git rev-parse')
+    .stdout.split('\n')
+    .map((line) => resolve(cwd, line)) as [string, string, string];
+  // git 報的是標準化的根；私有目錄用同一種寫法比。
+  const directory = await canonicalPath(await scratch());
+  const objects = join(directory, 'objects');
+  await mkdir(objects, { recursive: true });
+  const excludes = isInside(root, directory) ? [toPosix(relative(root, directory))] : [];
+  const env = {
+    GIT_OBJECT_DIRECTORY: objects,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: repositoryObjects,
+  };
+  return { root, gitDir, scratch: directory, env, excludes };
+}
+
+/**
+ * 把整個工作樹（含未追蹤與改過的檔，不含被忽略的）寫成一棵樹，經由一份以 repo 的 index 為種子的私有 index。
+ * 新的 blob 與樹落在私有物件庫；repo 的 index、物件庫、工作樹、ref 都不動，合併到一半的衝突項目也照留。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param signal - 取消。
+ * @returns 樹的物件 id。
+ */
+export async function snapshotTree(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  signal: AbortSignal,
+): Promise<string> {
+  const scratch = await mkdtemp(join(workspace.scratch, 'index-'));
+  try {
+    const index = join(scratch, 'index');
+    // 還沒有 index 的 repo（剛 `git init`）從空的開始。副本保留原本的時間戳，見檔頭第二段偏離。
+    // 先量時間戳再複製：兩步之間 index 被重寫的話，副本只會比內容舊，git 多讀幾個檔，不會少讀。
+    const source = join(workspace.gitDir, 'index');
+    const times = await stat(source).then(
+      ({ atime, mtime }) => ({ atime, mtime }),
+      (error: unknown) => {
+        if (!isMissing(error)) throw error;
+        return undefined;
+      },
+    );
+    if (times !== undefined) {
+      await copyFile(source, index);
+      await utimes(index, times.atime, times.mtime);
+    }
+    const env = { ...workspace.env, GIT_INDEX_FILE: index };
+    // `--ignore-errors` 跳過讀不到的檔，以結束碼 1 回報；index 照樣是完整的。
+    const pathspec =
+      workspace.excludes.length === 0
+        ? []
+        : ['--', '.', ...workspace.excludes.map((path) => `:(exclude)${path}`)];
+    const added = await git.run(['add', '--all', '--ignore-errors', ...pathspec], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env,
+      signal,
+    });
+    if (added.exitCode !== 1) ok(added, `git add in ${workspace.root}`);
+    const tree = await git.run(['write-tree'], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env,
+      signal,
+    });
+    return ok(tree, 'git write-tree').stdout.trim();
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/** 一棵快照樹在某個路徑上的 blob。 */
+export interface TreeBlob {
+  readonly oid: string;
+  /** 物件大小（位元組）。 */
+  readonly size: number;
+}
+
+/**
+ * 一棵快照樹在某個路徑上的 blob。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param tree - 快照樹 id。
+ * @param path - 相對 repo 根、斜線分隔的路徑。
+ * @param signal - 取消。
+ * @returns blob；那個路徑上沒有東西、或是 gitlink、樹時是 `null`。
+ */
+export async function treeBlob(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  tree: string,
+  path: string,
+  signal: AbortSignal,
+): Promise<TreeBlob | null> {
+  // 路徑是 pathspec；照字面比，檔名裡的 `*`、`?`、`[` 才不會選到別的項目。
+  const result = ok(
+    await git.run(['ls-tree', '-z', '-l', tree, '--', path], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env: { ...workspace.env, GIT_LITERAL_PATHSPECS: '1' },
+      signal,
+    }),
+    'git ls-tree',
+  );
+  const entry = result.stdout.split('\0')[0]!;
+  const match = /^\d+ (\S+) ([0-9a-f]+) +(\d+)\t/.exec(entry);
+  if (match?.[1] !== 'blob') return null;
+  return { oid: match[2]!, size: Number(match[3]) };
+}
+
+/**
+ * 一個 {@link treeBlob} 量過大小、在上限內的 blob 的文字。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param oid - blob id。
+ * @param maxBytes - 呼叫端量大小時用的上限（含）。
+ * @param signal - 取消。
+ * @returns 以 UTF-8 解出的 blob。
+ */
+export async function blobText(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  oid: string,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
+  const result = ok(
+    await git.run(['cat-file', 'blob', oid], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env: workspace.env,
+      maxBytes,
+      signal,
+    }),
+    'git cat-file',
+  );
+  // 呼叫端先用 treeBlob 量過；blob 不會變，所以這裡超不過。
+  if (result.truncated) throw new Error(`blob ${oid} exceeds ${maxBytes} bytes`);
+  return result.stdout;
+}
+
+/**
+ * 兩棵快照樹之間逐檔的行數，偵測改名。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param before - 輪開始的樹。
+ * @param after - 輪結束的樹。
+ * @param signal - 取消。
+ * @returns 改過的檔，路徑相對 repo 根。
+ * @throws git 失敗、或輸出超過上限。
+ */
+export async function diffTrees(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  before: string,
+  after: string,
+  signal: AbortSignal,
+): Promise<NumstatEntry[]> {
+  if (before === after) return [];
+  const result = ok(
+    await git.run(['diff-tree', '-r', '-M', '-z', '--numstat', before, after], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env: workspace.env,
+      signal,
+    }),
+    'git diff-tree',
+  );
+  if (result.truncated) throw new Error('git diff-tree output exceeded the configured cap');
+  return parseNumstat(result.stdout);
+}
+
+/**
+ * index 記成 gitlink 的工作樹目錄：巢狀 repo 與 submodule。快照不會往裡走，`check-ignore` 也不肯判。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param signal - 取消。
+ * @returns 相對 repo 根、斜線分隔的 gitlink 路徑。
+ */
+export async function gitlinkPaths(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  signal: AbortSignal,
+): Promise<Set<string>> {
+  const result = ok(
+    await git.run(['ls-files', '-z', '--stage'], {
+      cwd: workspace.root,
+      writable: [workspace.scratch],
+      env: workspace.env,
+      signal,
+    }),
+    'git ls-files',
+  );
+  const links = new Set<string>();
+  for (const entry of result.stdout.split('\0')) {
+    if (entry.startsWith('160000 ')) links.add(entry.slice(entry.indexOf('\t') + 1));
+  }
+  return links;
+}
+
+/**
+ * 工作樹路徑裡被 repo 忽略的那些。已追蹤的檔永遠不會回報，所以一個符合忽略規則、但已追蹤的檔仍算快照蓋得到。
+ * @param git - runner。
+ * @param workspace - repo。
+ * @param paths - 相對 repo 根、斜線分隔的路徑。
+ * @param signal - 取消。
+ * @returns `paths` 裡被忽略的那些。
+ */
+export async function ignoredPaths(
+  git: GitRunner,
+  workspace: GitWorkspace,
+  paths: readonly string[],
+  signal: AbortSignal,
+): Promise<Set<string>> {
+  if (paths.length === 0) return new Set();
+  const result = await git.run(['check-ignore', '-z', '--stdin'], {
+    cwd: workspace.root,
+    writable: [workspace.scratch],
+    env: workspace.env,
+    stdin: `${paths.join('\0')}\0`,
+    signal,
+  });
+  if (result.exitCode === 1) return new Set();
+  return new Set(
+    ok(result, 'git check-ignore')
+      .stdout.split('\0')
+      .filter((path) => path !== ''),
+  );
+}
