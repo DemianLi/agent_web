@@ -22,6 +22,10 @@
 3. [`web/GLOSSARY.md`](web/GLOSSARY.md)：用詞對照。
 4. `web/src`：原始碼；`web/guard`、`web/catalog`、`web/e2e`：瀏覽器測試與元件目錄。
 
+## 嵌入對話框 `<nexus-chat>`
+
+要把對話框嵌進自己的系統（例如 3D 可視化），見 [`docs/embed-chat.md`](docs/embed-chat.md)：從哪裡開始讀、嵌入方式、用宿主頁工具讓對話控制宿主頁。
+
 ## 如何使用
 
 需要 Node `^22.19.0 || >=24`、pnpm 10.34.5。
